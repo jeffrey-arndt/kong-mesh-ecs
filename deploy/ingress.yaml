@@ -1,0 +1,256 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: Kong Mesh Ingress (Zone Ingress) for inter-zone communication
+Parameters:
+  VPCStackName:
+    Type: String
+    Description: Stack used to create the VPC
+  CPStackName:
+    Type: String
+    Description: Cloudformation stack used to provision the control plane
+  SidecarImage:
+    Type: String
+    Default: "docker.io/kong/kuma-dp:2.12.3"
+    Description: Name of the kuma-dp docker image
+  DesiredCount:
+    Type: String
+    Default: 1
+    Description: Desired replica count of the ingress
+  DataplaneSecretPrefix:
+    Type: String
+    Default: "kong-mesh-ecs"
+    Description: Prefix to use for naming dataplane token secrets
+  IngressPort:
+    Type: Number
+    Default: 10001
+    Description: Port for zone ingress traffic
+Mappings:
+  Config:
+    Sidecar:
+      Mesh: default
+      Template: |
+        ---
+        type: ZoneIngress
+        name: "{{ dpname }}"
+        networking:
+          address: "{{ address }}"
+          advertisedAddress: "{{ advertisedAddress }}"
+          advertisedPort: {{ advertisedPort }}
+          port: {{ port }}
+    Workload:
+      Name: zone-ingress
+Resources:
+  DPTokenSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Description: Secret containing Kuma Dataplane Token for Zone Ingress
+      Name: !Join ["/", [!Ref DataplaneSecretPrefix, !FindInMap [Config, Workload, Name]]]
+      SecretString: "{}"
+
+  # Load balancer configuration for ingress
+  LoadBalancerTargetIngress:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      TargetType: ip
+      Port: !Ref IngressPort
+      Protocol: TCP
+      VpcId:
+        Fn::ImportValue: !Join [":", [!Ref VPCStackName, VPCId]]
+      HealthCheckEnabled: true
+      HealthCheckProtocol: TCP
+      HealthCheckIntervalSeconds: 30
+
+  LoadBalancerListenerIngress:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn:
+        Fn::ImportValue: !Join [":", [!Ref VPCStackName, LoadBalancer]]
+      Port: !Ref IngressPort
+      Protocol: TCP
+      DefaultActions:
+        - Type: forward
+          ForwardConfig:
+            TargetGroups:
+              - TargetGroupArn: !Ref LoadBalancerTargetIngress
+
+  # IAM Roles
+  IngressTaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: [ecs-tasks.amazonaws.com]
+            Action: [sts:AssumeRole]
+      Policies:
+        - PolicyName: get-kuma-dp-token-secret
+          PolicyDocument:
+            Statement:
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                Resource:
+                  - !Ref DPTokenSecret
+                  - Fn::ImportValue: !Join [":", [!Ref CPStackName, CPCASecret]]
+      Path: /
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly
+        - arn:aws:iam::aws:policy/CloudWatchLogsFullAccess
+
+  IngressTaskIamRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Path: /
+      AssumeRolePolicyDocument: |
+        {
+            "Statement": [{
+                "Effect": "Allow",
+                "Principal": { "Service": [ "ecs-tasks.amazonaws.com" ]},
+                "Action": [ "sts:AssumeRole" ]
+            }]
+        }
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/CloudWatchFullAccess
+        - arn:aws:iam::aws:policy/AWSXRayDaemonWriteAccess
+        - arn:aws:iam::aws:policy/AWSAppMeshEnvoyAccess
+      Tags:
+        - Key: kuma.io/type
+          Value: ingress
+        - Key: kuma.io/mesh
+          Value: default
+        - Key: kuma.io/service
+          Value: !FindInMap [Config, Workload, Name]
+
+  LogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Ref AWS::StackName
+      RetentionInDays: 7
+
+  IngressSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for Kong Mesh Zone Ingress
+      SecurityGroupIngress:
+        # Allow ingress traffic from other zones on ingress port
+        - CidrIp: "0.0.0.0/0"
+          IpProtocol: tcp
+          ToPort: !Ref IngressPort
+          FromPort: !Ref IngressPort
+        # Allow Envoy admin interface
+        - CidrIp: "10.0.0.0/8"
+          IpProtocol: tcp
+          ToPort: 9901
+          FromPort: 9901
+      VpcId:
+        Fn::ImportValue: !Join [":", [!Ref VPCStackName, VPCId]]
+
+  # ECS Service Discovery for ingress
+  DiscoveryServiceIngress:
+    Type: AWS::ServiceDiscovery::Service
+    Properties:
+      Description: Discovery Service for Kong Mesh Zone Ingress
+      DnsConfig:
+        RoutingPolicy: MULTIVALUE
+        DnsRecords:
+          - TTL: 60
+            Type: A
+      HealthCheckCustomConfig:
+        FailureThreshold: 1
+      Name: !FindInMap [Config, Workload, Name]
+      NamespaceId:
+        Fn::ImportValue: !Join [":", [!Ref VPCStackName, PrivateNamespace]]
+
+  ServiceIngress:
+    Type: AWS::ECS::Service
+    Properties:
+      LaunchType: FARGATE
+      Cluster:
+        Fn::ImportValue: !Join [":", [!Ref VPCStackName, ClusterName]]
+      DesiredCount: !Ref DesiredCount
+      TaskDefinition: !Ref TaskDefinitionIngress
+      ServiceName: !FindInMap [Config, Workload, Name]
+      ServiceRegistries:
+        - RegistryArn: !GetAtt DiscoveryServiceIngress.Arn
+      LoadBalancers:
+        - TargetGroupArn: !Ref LoadBalancerTargetIngress
+          ContainerPort: !Ref IngressPort
+          ContainerName: kuma-dp
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: ENABLED
+          Subnets:
+            - Fn::ImportValue: !Join [":", [!Ref VPCStackName, PublicSubnet]]
+          SecurityGroups:
+            - !Ref IngressSecurityGroup
+            - Fn::ImportValue:
+                !Join [":", [!Ref VPCStackName, FargateContainerSecurityGroup]]
+      Tags:
+        - Key: kuma.io/service
+          Value: !FindInMap [Config, Workload, Name]
+
+  TaskDefinitionIngress:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !FindInMap [Config, Workload, Name]
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - FARGATE
+      TaskRoleArn: !Ref IngressTaskIamRole
+      ExecutionRoleArn: !Ref IngressTaskExecutionRole
+      Cpu: 512
+      Memory: 1024
+      ContainerDefinitions:
+        - Name: kuma-dp
+          Image: !Ref SidecarImage
+          PortMappings:
+            - ContainerPort: !Ref IngressPort
+              Protocol: tcp
+            - ContainerPort: 9901
+              Protocol: tcp
+          Essential: true
+          User: "5678"
+          Secrets:
+            - Name: KUMA_CONTROL_PLANE_CA_CERT
+              ValueFrom:
+                Fn::ImportValue: !Join [":", [!Ref CPStackName, CPCASecret]]
+          Environment:
+            - Name: KUMA_DATAPLANE_RUNTIME_RESOURCE
+              Value: !FindInMap [Config, Sidecar, Template]
+          EntryPoint: ["sh", "-c"]
+          Command:
+            - !Sub
+              - |
+                kuma-dp run \
+                  --cp-address https://${CPAddress}:5678 \
+                  --proxy-type=ingress \
+                  --dataplane-var dpname=`hostname -s` \
+                  --dataplane-var address=`hostname -i` \
+                  --dataplane-var advertisedAddress=${ExternalCPAddress} \
+                  --dataplane-var advertisedPort=${IngressPort} \
+                  --dataplane-var port=${IngressPort} \
+                  --auth-type=aws
+              - CPAddress:
+                  Fn::ImportValue: !Join [":", [!Ref CPStackName, CPAddress]]
+                ExternalCPAddress:
+                  Fn::ImportValue: !Join [":", [!Ref VPCStackName, ExternalCPAddress]]
+                IngressPort: !Ref IngressPort
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref AWS::StackName
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: kuma-dp
+
+Outputs:
+  IngressAddress:
+    Description: External address of the zone ingress for inter-zone communication
+    Value:
+      Fn::ImportValue: !Join [":", [!Ref VPCStackName, ExternalCPAddress]]
+    Export:
+      Name: !Join [":", [!Ref AWS::StackName, IngressAddress]]
+  IngressPort:
+    Description: Port for zone ingress traffic
+    Value: !Ref IngressPort
+    Export:
+      Name: !Join [":", [!Ref AWS::StackName, IngressPort]]
