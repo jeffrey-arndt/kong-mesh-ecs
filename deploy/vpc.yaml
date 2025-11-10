@@ -1,25 +1,38 @@
 AWSTemplateFormatVersion: "2010-09-09"
 Description: VPC and ECS cluster stack
 Parameters:
+  ZoneIdentifier:
+    Type: String
+    Default: zone1
+    Description: Unique identifier for this zone (e.g., zone1, zone2, us-east, eu-west)
   TLD:
     Type: String
     Default: kongmesh
     Description: Internal TLD for Kuma mesh
-Mappings:
-  SubnetConfig:
-    VPC:
-      CIDR: "10.0.0.0/16"
-    Public:
-      CIDR: "10.0.0.0/24"
-    Public2:
-      CIDR: "10.0.1.0/24"
+  VpcCIDR:
+    Type: String
+    Default: "10.0.0.0/16"
+    Description: CIDR block for VPC (use different ranges for multiple zones, e.g., 10.0.0.0/16, 10.1.0.0/16)
+  PublicSubnet1CIDR:
+    Type: String
+    Default: "10.0.0.0/24"
+    Description: CIDR block for first public subnet
+  PublicSubnet2CIDR:
+    Type: String
+    Default: "10.0.1.0/24"
+    Description: CIDR block for second public subnet
 Resources:
   VPC:
     Type: AWS::EC2::VPC
     Properties:
       EnableDnsSupport: true
       EnableDnsHostnames: true
-      CidrBlock: !FindInMap [SubnetConfig, VPC, CIDR]
+      CidrBlock: !Ref VpcCIDR
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-${ZoneIdentifier}"
+        - Key: Zone
+          Value: !Ref ZoneIdentifier
 
   # Two public subnets (we need at least 2 for Aurora)
   PublicSubnet:
@@ -30,8 +43,11 @@ Resources:
           - 0
           - Fn::GetAZs: { Ref: AWS::Region }
       VpcId: !Ref "VPC"
-      CidrBlock: !FindInMap [SubnetConfig, Public, CIDR]
+      CidrBlock: !Ref PublicSubnet1CIDR
       MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-${ZoneIdentifier}-public-1"
 
   PublicSubnet2:
     Type: AWS::EC2::Subnet
@@ -41,8 +57,11 @@ Resources:
           - 1
           - Fn::GetAZs: { Ref: AWS::Region }
       VpcId: !Ref VPC
-      CidrBlock: !FindInMap [SubnetConfig, Public2, CIDR]
+      CidrBlock: !Ref PublicSubnet2CIDR
       MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-${ZoneIdentifier}-public-2"
 
   # Containers in the public subnets have public IP addresses and
   # the routing table sends network traffic via the internet gateway.
@@ -84,6 +103,11 @@ Resources:
   # ECS Resources
   ECSCluster:
     Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Sub "${AWS::StackName}-${ZoneIdentifier}"
+      Tags:
+        - Key: Zone
+          Value: !Ref ZoneIdentifier
 
   # A security group for the containers we will run in Fargate.
   # A rule, allowing network traffic from other members of the
@@ -173,9 +197,9 @@ Resources:
   MyPrivateHostedZone:
     Type: AWS::Route53::HostedZone
     Properties:
-      Name: mesh.local
+      Name: !Sub "mesh.${ZoneIdentifier}.local"
       HostedZoneConfig:
-        Comment: "Private hosted zone for internal services mesh"
+        Comment: !Sub "Private hosted zone for ${ZoneIdentifier} mesh services"
       VPCs:
         - VPCId: !Ref "VPC"
           VPCRegion: !Ref AWS::Region
@@ -244,3 +268,8 @@ Outputs:
     Value: !Ref "MyPrivateHostedZone"
     Export:
       Name: !Join [":", [!Ref AWS::StackName, HostedZoneId]]
+  ZoneIdentifier:
+    Description: The zone identifier for this deployment
+    Value: !Ref ZoneIdentifier
+    Export:
+      Name: !Join [":", [!Ref AWS::StackName, ZoneIdentifier]]

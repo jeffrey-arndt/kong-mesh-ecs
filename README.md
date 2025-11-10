@@ -9,7 +9,104 @@ It provisions all the necessary AWS infrastructure for
 running a standalone Kong Mesh zone with a postgres backend (on AWS Aurora)
 and runs the [Kuma counter demo](https://github.com/kumahq/kuma-counter-demo).
 
-## Deploying
+## Quick Start (Automated Deployment)
+
+The easiest way to deploy is using the included automation scripts:
+
+### Prerequisites
+
+- [AWS CLI](https://aws.amazon.com/cli/) configured with appropriate credentials
+- [kumactl](https://docs.konghq.com/mesh/) installed
+- [jq](https://stedolan.github.io/jq/) installed
+- Access to a Konnect account (sign up at [konghq.com](https://konghq.com/))
+
+### Single Zone Deployment
+
+1. Create a zone in Konnect (Environment: **Universal**) and extract:
+   - KDS address (e.g., `grpcs://us.mesh.sync.konghq.com:443`)
+   - CP ID (e.g., `61e5904f-bc3e-401e-9144-d4aa3983a921`)
+   - Authentication token (e.g., `spat_...`)
+
+2. Run the deployment script:
+
+```bash
+./deploy-zone.sh \
+  --zone-name zone1 \
+  --kds-address grpcs://us.mesh.sync.konghq.com:443 \
+  --cp-id 61e5904f-bc3e-401e-9144-d4aa3983a921 \
+  --konnect-token spat_YOUR_TOKEN_HERE
+```
+
+This automatically:
+- Creates AWS Secrets for TLS and Konnect credentials
+- Deploys VPC, ECS cluster, and networking
+- Generates and stores TLS certificates
+- Deploys Kong Mesh control plane (connected to Konnect)
+- Deploys zone ingress for multi-zone communication
+- Deploys demo applications (Redis + counter app)
+
+### Multi-Zone Deployment
+
+Deploy a second zone with different CIDR ranges:
+
+```bash
+./deploy-zone.sh \
+  --zone-name zone2 \
+  --vpc-cidr 10.1.0.0/16 \
+  --subnet1-cidr 10.1.0.0/24 \
+  --subnet2-cidr 10.1.1.0/24 \
+  --kds-address grpcs://us.mesh.sync.konghq.com:443 \
+  --cp-id 61e5904f-bc3e-401e-9144-d4aa3983a921 \
+  --konnect-token spat_YOUR_TOKEN_HERE
+```
+
+### Cleanup
+
+Remove all deployed resources:
+
+```bash
+./cleanup-zone.sh --zone-name zone1
+```
+
+To keep secrets for faster redeployment:
+
+```bash
+./cleanup-zone.sh --zone-name zone1 --keep-secrets
+```
+
+### Script Options
+
+#### deploy-zone.sh
+
+**Required:**
+- `--zone-name NAME` - Zone identifier (e.g., zone1, us-east, production)
+- `--kds-address ADDR` - Konnect KDS endpoint
+- `--cp-id ID` - Konnect CP ID
+- `--konnect-token TOKEN` - Konnect authentication token
+
+**Optional:**
+- `--license-file PATH` - Kong Mesh license (not needed for Konnect)
+- `--vpc-cidr CIDR` - VPC CIDR block (default: 10.0.0.0/16)
+- `--subnet1-cidr CIDR` - Subnet 1 CIDR (default: 10.0.0.0/24)
+- `--subnet2-cidr CIDR` - Subnet 2 CIDR (default: 10.0.1.0/24)
+- `--region REGION` - AWS region (default: us-east-2)
+- `--skip-demo` - Skip demo apps
+- `--skip-ingress` - Skip zone ingress
+
+#### cleanup-zone.sh
+
+**Required:**
+- `--zone-name NAME` - Zone to cleanup
+
+**Optional:**
+- `--region REGION` - AWS region (default: us-east-2)
+- `--keep-secrets` - Preserve secrets for redeployment
+- `--skip-demo` - Skip demo cleanup (if not deployed)
+- `--skip-ingress` - Skip ingress cleanup (if not deployed)
+
+---
+
+## Manual Deployment
 
 The example deployment consists of CloudFormation stacks for setting up the mesh:
 
@@ -267,13 +364,102 @@ two services works and how to configure it.
 The `demo-app` stack exposes the server on port `80` of the NLB so
 our app is now running and accessible `http://${CP_ADDR}:80`.
 
+### Zone Ingress (for multi-zone deployments)
+
+For zone-to-zone communication in a multi-zone mesh, deploy the zone ingress:
+
+```
+aws cloudformation deploy \
+    --capabilities CAPABILITY_IAM \
+    --stack-name ecs-demo-ingress \
+    --parameter-overrides VPCStackName=ecs-demo-vpc CPStackName=ecs-demo-kong-mesh-cp \
+    --template-file deploy/ingress.yaml
+```
+
+The zone ingress enables dataplanes in this zone to be accessible from other zones in the mesh.
+
+### Deploying Multiple Zones
+
+To deploy multiple ECS zones in the same account/region for a multi-zone mesh:
+
+1. Each zone needs its own VPC stack with unique CIDR ranges and zone identifier:
+
+```bash
+# Zone 1
+aws cloudformation deploy \
+    --capabilities CAPABILITY_IAM \
+    --stack-name ecs-zone1-vpc \
+    --parameter-overrides ZoneIdentifier=zone1 VpcCIDR=10.0.0.0/16 PublicSubnet1CIDR=10.0.0.0/24 PublicSubnet2CIDR=10.0.1.0/24 \
+    --template-file deploy/vpc.yaml
+
+# Zone 2
+aws cloudformation deploy \
+    --capabilities CAPABILITY_IAM \
+    --stack-name ecs-zone2-vpc \
+    --parameter-overrides ZoneIdentifier=zone2 VpcCIDR=10.1.0.0/16 PublicSubnet1CIDR=10.1.0.0/24 PublicSubnet2CIDR=10.1.1.0/24 \
+    --template-file deploy/vpc.yaml
+```
+
+2. Deploy control planes for each zone, connected to Konnect:
+
+```bash
+# Zone 1 CP
+aws cloudformation deploy \
+    --capabilities CAPABILITY_IAM \
+    --stack-name ecs-zone1-kong-mesh-cp \
+    --parameter-overrides VPCStackName=ecs-zone1-vpc \
+      ZoneName=zone1 \
+      LicenseSecret=${LICENSE_SECRET} \
+      ServerKeySecret=${TLS_KEY_ZONE1} \
+      ServerCertSecret=${TLS_CERT_ZONE1} \
+      GlobalKDSAddress=${KDS_ADDR} \
+      GlobalCPTokenSecret=${CP_TOKEN_SECRET} \
+      KonnectCPId=${CP_ID} \
+    --template-file deploy/controlplane.yaml
+
+# Zone 2 CP
+aws cloudformation deploy \
+    --capabilities CAPABILITY_IAM \
+    --stack-name ecs-zone2-kong-mesh-cp \
+    --parameter-overrides VPCStackName=ecs-zone2-vpc \
+      ZoneName=zone2 \
+      LicenseSecret=${LICENSE_SECRET} \
+      ServerKeySecret=${TLS_KEY_ZONE2} \
+      ServerCertSecret=${TLS_CERT_ZONE2} \
+      GlobalKDSAddress=${KDS_ADDR} \
+      GlobalCPTokenSecret=${CP_TOKEN_SECRET} \
+      KonnectCPId=${CP_ID} \
+    --template-file deploy/controlplane.yaml
+```
+
+3. Deploy zone ingress for each zone (required for inter-zone communication):
+
+```bash
+# Zone 1 Ingress
+aws cloudformation deploy \
+    --capabilities CAPABILITY_IAM \
+    --stack-name ecs-zone1-ingress \
+    --parameter-overrides VPCStackName=ecs-zone1-vpc CPStackName=ecs-zone1-kong-mesh-cp \
+    --template-file deploy/ingress.yaml
+
+# Zone 2 Ingress
+aws cloudformation deploy \
+    --capabilities CAPABILITY_IAM \
+    --stack-name ecs-zone2-ingress \
+    --parameter-overrides VPCStackName=ecs-zone2-vpc CPStackName=ecs-zone2-kong-mesh-cp \
+    --template-file deploy/ingress.yaml
+```
+
+4. Deploy applications to each zone using the respective VPC and CP stack names.
+
 ### Cleanup
 
 To cleanup the resources we created you can execute the following:
 
 ```
 aws cloudformation delete-stack --stack-name ecs-demo-demo-app
-aws cloudformation delete-stack --stack-name ecs-demo-demo-redis
+aws cloudformation delete-stack --stack-name ecs-demo-redis
+aws cloudformation delete-stack --stack-name ecs-demo-ingress
 aws cloudformation delete-stack --stack-name ecs-demo-kong-mesh-cp
 aws secretsmanager delete-secret --secret-id ${TLS_CERT}
 aws secretsmanager delete-secret --secret-id ${TLS_KEY}
@@ -290,26 +476,30 @@ After we have accessed the secret, we can remove the final two containers in our
 
 ## Usage
 
-When running Kong Mesh on ECS + Fargate, you'll need to list the services in the mesh
-that your task communicates with. These are called
-[_outbounds_](https://kuma.io/docs/1.4.x/documentation/dps-and-data-model/#dataplane-specification).
+### Dynamic Outbounds with Route53
 
-This entails editing the `Dataplane` template in the CloudFormation template
-used to deploy your application.
+This repository uses **dynamic outbounds** via Route53 integration, which automatically
+discovers and configures service endpoints without requiring manual outbound configuration.
 
-We can see this in the [`demo-app`
-template parameter `DPTemplate`](./deploy/counter-demo/demo-app.yaml):
+The dataplanes use the `--bind-outbounds` flag (see [demo-app.yaml](./deploy/counter-demo/demo-app.yaml#L268))
+which enables automatic service discovery. Services can be reached via the mesh DNS:
 
-```
-        outbound:
-        - port: 6379
-          tags:
-            kuma.io/service: redis
-```
+- `<service-name>.mesh.local:8080` - for services in the local zone
+- For cross-zone communication, the mesh automatically routes through zone ingress gateways
 
-Here we're telling Kong Mesh that our `demo-app` will communicate with the `redis`
-service. The sidecar is then configured to route requests to `redis:6379` to our
-`redis` service.
+The control plane is configured with Route53 integration (see [controlplane.yaml](./deploy/controlplane.yaml#L390-L394)):
+- `KMESH_RUNTIME_AWS_ROUTE53_ENABLED=true`
+- Automatic DNS record management in the private hosted zone
+
+This eliminates the need to manually list outbound services in the Dataplane specification,
+as was required in older versions of Kong Mesh on ECS.
+
+### Service Communication Example
+
+In the demo app, the frontend communicates with Redis simply by:
+- Setting `REDIS_HOST=redis.mesh.local` and `REDIS_PORT=8080` (see [demo-app.yaml](./deploy/counter-demo/demo-app.yaml#L216-L218))
+- The mesh automatically resolves and routes the traffic via Envoy sidecars
+- No manual outbound configuration needed in the Dataplane template
 
 ## CI
 

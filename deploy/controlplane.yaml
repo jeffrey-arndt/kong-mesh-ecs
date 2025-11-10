@@ -8,7 +8,7 @@ Parameters:
       to locate and reference resources created by that stack.
   Image:
     Type: String
-    Default: "docker.io/kong/kuma-cp:2.1.1"
+    Default: "docker.io/kong/kuma-cp:2.12.3"
     Description: Name of the control plane docker image
   AllowedCidr:
     Type: String
@@ -38,7 +38,8 @@ Parameters:
 
   LicenseSecret:
     Type: String
-    Description: Secret ARN holding a Kong Mesh license
+    Default: ""
+    Description: Secret ARN holding a Kong Mesh license (not required when using Konnect)
 
   ServerCertSecret:
     Type: String
@@ -50,6 +51,7 @@ Conditions:
   IsMultizone: !And
     - !Not [!Equals [!Ref GlobalKDSAddress, ""]]
     - !Not [!Equals [!Ref GlobalCPTokenSecret, ""]]
+  HasLicense: !Not [!Equals [!Ref LicenseSecret, ""]]
 Resources:
   # Database
   DBSubnetGroup:
@@ -172,17 +174,20 @@ Resources:
               Service: [ecs-tasks.amazonaws.com]
             Action: [sts:AssumeRole]
       Policies:
-        - PolicyName: get-license-secret
+        - PolicyName: get-secrets
           PolicyDocument:
             Statement:
               - Effect: Allow
                 Action:
                   - secretsmanager:GetSecretValue
                 Resource:
-                  - !Ref LicenseSecret
                   - !Ref CPDatabasePassword
                   - !Ref ServerCertSecret
                   - !Ref ServerKeySecret
+                  - !If
+                    - HasLicense
+                    - !Ref LicenseSecret
+                    - !Ref AWS::NoValue
                   - !If
                     - IsMultizone
                     - !Ref GlobalCPTokenSecret
@@ -318,6 +323,11 @@ Resources:
           Secrets:
             - Name: KUMA_STORE_POSTGRES_PASSWORD
               ValueFrom: !Ref CPDatabasePassword
+            - !If
+              - HasLicense
+              - Name: KMESH_LICENSE
+                ValueFrom: !Ref LicenseSecret
+              - !Ref AWS::NoValue
           Environment:
             - Name: KUMA_STORE_TYPE
               Value: postgres
@@ -355,10 +365,15 @@ Resources:
               Protocol: tcp
           User: root:root # needed for UDP port 53 binding
           Environment:
+            - Name: KUMA_ENVIRONMENT
+              Value: universal
             - Name: KUMA_MODE
               Value: zone
-            - Name: KMESH_LICENSE_PATH
-              Value: /tmp/license.json
+            - !If
+              - HasLicense
+              - Name: KMESH_LICENSE_PATH
+                Value: /tmp/license.json
+              - !Ref AWS::NoValue
             - Name: KUMA_GENERAL_TLS_CERT_FILE
               Value: /tmp/crt.pem
             - Name: KUMA_GENERAL_TLS_KEY_FILE
@@ -434,8 +449,6 @@ Resources:
                 Value: "cpToken"
               - !Ref AWS::NoValue
           Secrets:
-            - Name: KMESH_LICENSE
-              ValueFrom: !Ref LicenseSecret
             - Name: KUMA_STORE_POSTGRES_PASSWORD
               ValueFrom: !Ref CPDatabasePassword
             - Name: TLS_CRT
@@ -450,7 +463,10 @@ Resources:
           EntryPoint:
             - sh
             - -c
-            - echo "${TLS_CRT}" > "${KUMA_GENERAL_TLS_CERT_FILE}" && echo "${TLS_KEY}" > "${KUMA_GENERAL_TLS_KEY_FILE}" && echo "${KMESH_LICENSE}" > "${KMESH_LICENSE_PATH}" && echo "${KDS_AUTH_CP_TOKEN}" > "${KMESH_MULTIZONE_ZONE_KDS_AUTH_CP_TOKEN_PATH}"; kuma-cp run
+            - !If
+              - HasLicense
+              - echo "${TLS_CRT}" > "${KUMA_GENERAL_TLS_CERT_FILE}" && echo "${TLS_KEY}" > "${KUMA_GENERAL_TLS_KEY_FILE}" && echo "${KMESH_LICENSE}" > "${KMESH_LICENSE_PATH}" && echo "${KDS_AUTH_CP_TOKEN}" > "${KMESH_MULTIZONE_ZONE_KDS_AUTH_CP_TOKEN_PATH}"; kuma-cp run
+              - echo "${TLS_CRT}" > "${KUMA_GENERAL_TLS_CERT_FILE}" && echo "${TLS_KEY}" > "${KUMA_GENERAL_TLS_KEY_FILE}" && echo "${KDS_AUTH_CP_TOKEN}" > "${KMESH_MULTIZONE_ZONE_KDS_AUTH_CP_TOKEN_PATH}"; kuma-cp run
           HealthCheck:
             Command:
               [
@@ -534,3 +550,14 @@ Outputs:
     Value: !Ref ServerCertSecret
     Export:
       Name: !Join [":", [!Ref AWS::StackName, CPCASecret]]
+  ZoneName:
+    Description: The name of the mesh zone
+    Value: !Ref ZoneName
+    Export:
+      Name: !Join [":", [!Ref AWS::StackName, ZoneName]]
+  HostedZoneId:
+    Description: The ID of the Route53 hosted zone for dynamic outbounds
+    Value: !ImportValue
+      Fn::Sub: "${VPCStackName}:HostedZoneId"
+    Export:
+      Name: !Join [":", [!Ref AWS::StackName, HostedZoneId]]
